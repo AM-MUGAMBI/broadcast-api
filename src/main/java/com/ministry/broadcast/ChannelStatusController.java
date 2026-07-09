@@ -20,6 +20,17 @@ public class ChannelStatusController {
         return service.getStatus(channel);
     }
 
+    @GetMapping("/api/resolve-channel")
+    public ChannelStatusService.ResolvedChannel resolveChannel(@RequestParam String input) {
+        return service.resolveHandle(input);
+    }
+
+    @GetMapping("/api/channel-status-custom")
+    public ChannelStatus customChannelStatus(@RequestParam String channelId, @RequestParam(required = false) String handle) {
+        ChannelRegistry.ChannelInfo info = new ChannelRegistry.ChannelInfo(channelId, channelId, handle);
+        return service.getStatus(info);
+    }
+
     @GetMapping("/health")
     public String health() {
         return "ok";

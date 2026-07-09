@@ -22,6 +22,7 @@ public class ChannelStatusService {
 
     private final HttpClient http = HttpClient.newBuilder()
         .connectTimeout(Duration.ofSeconds(8))
+        .followRedirects(HttpClient.Redirect.NORMAL)
         .build();
 
     private final ObjectMapper mapper = new ObjectMapper();
@@ -35,6 +36,15 @@ public class ChannelStatusService {
     private final Map<String, CachedValue> liveCache = new ConcurrentHashMap<>();
     private final Map<String, CachedValue> latestCache = new ConcurrentHashMap<>();
 
+    // Remembers the last time we CONFIRMED a channel live. If a later check
+    // comes back negative (network hiccup, YouTube markup mismatch, transient
+    // block) within this grace window, we keep reporting live rather than
+    // flickering off — a real end-of-stream will simply fail to reconfirm
+    // for the whole window and then correctly flip to not-live.
+    private final Map<String, LiveRecord> lastConfirmedLive = new ConcurrentHashMap<>();
+    private static final Duration LIVE_GRACE_WINDOW = Duration.ofMinutes(4);
+
+    private record LiveRecord(String videoId, Instant seenAt) {}
     private record CachedValue(String videoId, Instant expiresAt) {}
 
     private static final Pattern CANONICAL_WATCH = Pattern.compile(
@@ -45,17 +55,109 @@ public class ChannelStatusService {
     public ChannelStatus getStatus(String key) {
         ChannelRegistry.ChannelInfo info = ChannelRegistry.get(key);
         if (info == null) {
-            return new ChannelStatus(key, null, false, Instant.now().toString());
+            return new ChannelStatus(key, null, false, Instant.now().toString(), "unknown_channel_key");
         }
+        return getStatus(info);
+    }
 
+    /**
+     * Same live-check + fallback logic, but for a channel that isn't in the
+     * static registry — used for visitor-added "My Channels".
+     */
+    public ChannelStatus getStatus(ChannelRegistry.ChannelInfo info) {
         String liveVideoId = checkLiveCached(info);
         if (liveVideoId != null) {
-            return new ChannelStatus(key, liveVideoId, true, Instant.now().toString());
+            lastConfirmedLive.put(info.key(), new LiveRecord(liveVideoId, Instant.now()));
+            return new ChannelStatus(info.key(), liveVideoId, true, Instant.now().toString(), null);
         }
 
-        String latestVideoId = latestPublicVideoCached(info);
-        return new ChannelStatus(key, latestVideoId, false, Instant.now().toString());
+        // This particular check came back negative — but if we confirmed
+        // live recently, treat this as a probable blip, not a real end.
+        LiveRecord lastLive = lastConfirmedLive.get(info.key());
+        if (lastLive != null && Duration.between(lastLive.seenAt(), Instant.now()).compareTo(LIVE_GRACE_WINDOW) < 0) {
+            return new ChannelStatus(info.key(), lastLive.videoId(), true, Instant.now().toString(),
+                "held over from last confirmed live check " + Duration.between(lastLive.seenAt(), Instant.now()).toSeconds() + "s ago");
+        }
+        lastConfirmedLive.remove(info.key());
+
+        if (apiKey == null || apiKey.isBlank()) {
+            return new ChannelStatus(info.key(), null, false, Instant.now().toString(),
+                "no_api_key: YOUTUBE_API_KEY is not set (or not being read) on the server");
+        }
+
+        FallbackResult fallback = latestPublicVideoCached(info);
+        return new ChannelStatus(info.key(), fallback.videoId(), false, Instant.now().toString(), fallback.note());
     }
+
+    /**
+     * Resolves a visitor-typed channel handle (e.g. "@somechannel", a full
+     * channel URL, or a raw UC... channel ID) into a real channel ID, so a
+     * "My Channels" card can be built and polled going forward.
+     */
+    public ResolvedChannel resolveHandle(String rawInput) {
+        String input = rawInput.trim();
+
+        // Already a raw channel ID (e.g. from a /channel/UC... URL)
+        Matcher channelIdInUrl = Pattern.compile("channel/(UC[a-zA-Z0-9_-]{20,})").matcher(input);
+        if (channelIdInUrl.find()) {
+            return fetchChannelTitleAndHandle(channelIdInUrl.group(1));
+        }
+        if (input.matches("UC[a-zA-Z0-9_-]{20,}")) {
+            return fetchChannelTitleAndHandle(input);
+        }
+
+        // Otherwise treat it as a handle — pull the @name out of a URL if one was pasted
+        String handle = input;
+        Matcher handleInUrl = Pattern.compile("youtube\\.com/@([a-zA-Z0-9_.-]+)").matcher(input);
+        if (handleInUrl.find()) {
+            handle = handleInUrl.group(1);
+        } else if (handle.startsWith("@")) {
+            handle = handle.substring(1);
+        }
+
+        if (apiKey == null || apiKey.isBlank()) {
+            return new ResolvedChannel(null, null, null, "no_api_key");
+        }
+
+        try {
+            String url = "https://www.googleapis.com/youtube/v3/channels"
+                + "?part=id,snippet&forHandle=" + handle + "&key=" + apiKey;
+            JsonNode root = getJson(url);
+            JsonNode items = root.path("items");
+            if (items.isEmpty()) {
+                return new ResolvedChannel(null, null, handle, "channel_not_found");
+            }
+            JsonNode first = items.get(0);
+            String channelId = first.path("id").asText();
+            String title = first.path("snippet").path("title").asText(handle);
+            return new ResolvedChannel(channelId, title, handle, null);
+        } catch (Exception e) {
+            return new ResolvedChannel(null, null, handle, "api_error: " + e.getMessage());
+        }
+    }
+
+    private ResolvedChannel fetchChannelTitleAndHandle(String channelId) {
+        if (apiKey == null || apiKey.isBlank()) {
+            return new ResolvedChannel(channelId, null, null, "no_api_key");
+        }
+        try {
+            String url = "https://www.googleapis.com/youtube/v3/channels"
+                + "?part=snippet&id=" + channelId + "&key=" + apiKey;
+            JsonNode root = getJson(url);
+            JsonNode items = root.path("items");
+            if (items.isEmpty()) {
+                return new ResolvedChannel(channelId, null, null, "channel_not_found");
+            }
+            JsonNode snippet = items.get(0).path("snippet");
+            String title = snippet.path("title").asText(channelId);
+            String customUrl = snippet.path("customUrl").asText(null);
+            return new ResolvedChannel(channelId, title, customUrl, null);
+        } catch (Exception e) {
+            return new ResolvedChannel(channelId, null, null, "api_error: " + e.getMessage());
+        }
+    }
+
+    public record ResolvedChannel(String channelId, String title, String handle, String error) {}
 
     // ---------- Live check: free, scrapes the public /live page ----------
 
@@ -71,7 +173,9 @@ public class ChannelStatusService {
 
     private String checkLive(ChannelRegistry.ChannelInfo info) {
         try {
-            String url = "https://www.youtube.com/@" + info.handle() + "/live";
+            String url = (info.handle() != null && !info.handle().isBlank())
+                ? "https://www.youtube.com/@" + info.handle() + "/live"
+                : "https://www.youtube.com/channel/" + info.channelId() + "/live";
             HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .header("User-Agent", "Mozilla/5.0 (compatible; ministry-broadcast-bot/1.0)")
@@ -95,28 +199,31 @@ public class ChannelStatusService {
 
     // ---------- Fallback: latest public upload via YouTube Data API ----------
 
-    private String latestPublicVideoCached(ChannelRegistry.ChannelInfo info) {
+    private record FallbackResult(String videoId, String note) {}
+
+    private FallbackResult latestPublicVideoCached(ChannelRegistry.ChannelInfo info) {
         CachedValue cached = latestCache.get(info.key());
         if (cached != null && cached.expiresAt().isAfter(Instant.now())) {
-            return cached.videoId();
+            return new FallbackResult(cached.videoId(), cached.videoId() != null ? null : "cached_null_result");
         }
-        String result = latestPublicVideo(info);
-        latestCache.put(info.key(), new CachedValue(result, Instant.now().plusSeconds(300)));
+        FallbackResult result = latestPublicVideo(info);
+        latestCache.put(info.key(), new CachedValue(result.videoId(), Instant.now().plusSeconds(300)));
         return result;
     }
 
-    private String latestPublicVideo(ChannelRegistry.ChannelInfo info) {
-        if (apiKey == null || apiKey.isBlank()) {
-            return null;
-        }
+    private FallbackResult latestPublicVideo(ChannelRegistry.ChannelInfo info) {
         try {
             List<String> candidateIds = fetchRecentVideoIds(info.uploadsPlaylistId(), 10);
             if (candidateIds.isEmpty()) {
-                return null;
+                return new FallbackResult(null, "playlistItems returned zero videos — check the uploads playlist ID");
             }
-            return firstPublicVideo(candidateIds);
+            String videoId = firstPublicVideo(candidateIds);
+            if (videoId == null) {
+                return new FallbackResult(null, "found " + candidateIds.size() + " recent videos, but none were public");
+            }
+            return new FallbackResult(videoId, null);
         } catch (Exception e) {
-            return null;
+            return new FallbackResult(null, "api_error: " + e.getClass().getSimpleName() + " - " + e.getMessage());
         }
     }
 

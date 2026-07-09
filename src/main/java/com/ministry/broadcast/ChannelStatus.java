@@ -4,5 +4,6 @@ public record ChannelStatus(
     String channel,
     String videoId,
     boolean live,
-    String checkedAt
+    String checkedAt,
+    String note
 ) {}
