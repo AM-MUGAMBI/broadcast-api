@@ -171,31 +171,74 @@ public class ChannelStatusService {
         return result;
     }
 
-    private String checkLive(ChannelRegistry.ChannelInfo info) {
-        try {
-            String url = (info.handle() != null && !info.handle().isBlank())
+   private String checkLive(ChannelRegistry.ChannelInfo info) {
+    try {
+        String url = (info.handle() != null && !info.handle().isBlank())
                 ? "https://www.youtube.com/@" + info.handle() + "/live"
                 : "https://www.youtube.com/channel/" + info.channelId() + "/live";
-            HttpRequest request = HttpRequest.newBuilder()
+
+        HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
-                .header("User-Agent", "Mozilla/5.0 (compatible; ministry-broadcast-bot/1.0)")
+                .header("User-Agent", "Mozilla/5.0")
                 .timeout(Duration.ofSeconds(8))
                 .GET()
                 .build();
 
-            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-            String body = response.body();
+        HttpResponse<String> response =
+                http.send(request, HttpResponse.BodyHandlers.ofString());
 
-            Matcher canonical = CANONICAL_WATCH.matcher(body);
-            if (canonical.find() && IS_LIVE_MARKER.matcher(body).find()) {
-                return canonical.group(1);
-            }
-        } catch (Exception e) {
-            // Network hiccup or YouTube changed their markup — fail safe to "not live"
-            // rather than breaking the whole response.
+        String body = response.body();
+
+        Matcher canonical = CANONICAL_WATCH.matcher(body);
+
+        if (!canonical.find()) {
+            return null;
         }
+
+        String videoId = canonical.group(1);
+
+        return isActuallyLive(videoId) ? videoId : null;
+
+    } catch (Exception e) {
         return null;
     }
+}
+private boolean isActuallyLive(String videoId) {
+    if (apiKey == null || apiKey.isBlank()) {
+        return false;
+    }
+
+    try {
+        String url =
+                "https://www.googleapis.com/youtube/v3/videos"
+                        + "?part=liveStreamingDetails&id="
+                        + videoId
+                        + "&key="
+                        + apiKey;
+
+        JsonNode root = getJson(url);
+
+        JsonNode items = root.path("items");
+
+        if (items.isEmpty()) {
+            return false;
+        }
+
+        JsonNode live = items.get(0).path("liveStreamingDetails");
+
+        if (live.isMissingNode()) {
+            return false;
+        }
+
+        boolean hasStarted = live.has("actualStartTime");
+        boolean hasEnded = live.has("actualEndTime");
+
+        return hasStarted && !hasEnded;
+
+    } catch (Exception e) {
+        return false;
+    }
+}
 
     // ---------- Fallback: latest public upload via YouTube Data API ----------
 
