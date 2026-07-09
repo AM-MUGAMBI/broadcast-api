@@ -42,7 +42,7 @@ public class ChannelStatusService {
     // flickering off — a real end-of-stream will simply fail to reconfirm
     // for the whole window and then correctly flip to not-live.
     private final Map<String, LiveRecord> lastConfirmedLive = new ConcurrentHashMap<>();
-    private static final Duration LIVE_GRACE_WINDOW = Duration.ofMinutes(4);
+    private static final Duration LIVE_GRACE_WINDOW = Duration.ofMinutes(6);
 
     private record LiveRecord(String videoId, Instant seenAt) {}
     private record CachedValue(String videoId, Instant expiresAt) {}
