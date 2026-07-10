@@ -171,72 +171,41 @@ public class ChannelStatusService {
         return result;
     }
 
-   private String checkLive(ChannelRegistry.ChannelInfo info) {
-    try {
-        String url = (info.handle() != null && !info.handle().isBlank())
-                ? "https://www.youtube.com/@" + info.handle() + "/live"
-                : "https://www.youtube.com/channel/" + info.channelId() + "/live";
+private String checkLive(ChannelRegistry.ChannelInfo info) {
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .header("User-Agent", "Mozilla/5.0")
-                .timeout(Duration.ofSeconds(8))
-                .GET()
-                .build();
-
-        HttpResponse<String> response =
-                http.send(request, HttpResponse.BodyHandlers.ofString());
-
-        String body = response.body();
-
-        Matcher canonical = CANONICAL_WATCH.matcher(body);
-
-        if (!canonical.find()) {
-            return null;
-        }
-
-        String videoId = canonical.group(1);
-
-        return isActuallyLive(videoId) ? videoId : null;
-
-    } catch (Exception e) {
+    if (apiKey == null || apiKey.isBlank()) {
         return null;
     }
-}
-private boolean isActuallyLive(String videoId) {
-    if (apiKey == null || apiKey.isBlank()) {
-        return false;
-    }
 
     try {
+
         String url =
-                "https://www.googleapis.com/youtube/v3/videos"
-                        + "?part=liveStreamingDetails&id="
-                        + videoId
-                        + "&key="
-                        + apiKey;
+                "https://www.googleapis.com/youtube/v3/search"
+                        + "?part=snippet"
+                        + "&channelId=" + info.channelId()
+                        + "&eventType=live"
+                        + "&type=video"
+                        + "&maxResults=1"
+                        + "&key=" + apiKey;
 
         JsonNode root = getJson(url);
 
         JsonNode items = root.path("items");
 
         if (items.isEmpty()) {
-            return false;
+            return null;
         }
 
-        JsonNode live = items.get(0).path("liveStreamingDetails");
+        String videoId =
+                items.get(0)
+                        .path("id")
+                        .path("videoId")
+                        .asText(null);
 
-        if (live.isMissingNode()) {
-            return false;
-        }
-
-        boolean hasStarted = live.has("actualStartTime");
-        boolean hasEnded = live.has("actualEndTime");
-
-        return hasStarted && !hasEnded;
+        return videoId;
 
     } catch (Exception e) {
-        return false;
+        return null;
     }
 }
 
