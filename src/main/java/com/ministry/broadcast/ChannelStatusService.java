@@ -30,74 +30,115 @@ public class ChannelStatusService {
     @Value("${youtube.api.key:}")
     private String apiKey;
 
-    // Simple in-memory cache so many visitors don't each trigger a fresh
-    // check. Live-status is cached briefly; the "latest upload" fallback
-    // (which costs quota) is cached longer.
-    private final Map<String, CachedValue> liveCache = new ConcurrentHashMap<>();
+    // Simple in-memory cache so many visitors don't each trigger a fresh check.
+    private final Map<String, CachedStatus> statusCache = new ConcurrentHashMap<>();
     private final Map<String, CachedValue> latestCache = new ConcurrentHashMap<>();
 
-    // Remembers the last time we CONFIRMED a channel live. If a later check
-    // comes back negative (network hiccup, YouTube markup mismatch, transient
-    // block) within this grace window, we keep reporting live rather than
-    // flickering off — a real end-of-stream will simply fail to reconfirm
-    // for the whole window and then correctly flip to not-live.
+    // Remembers the last time we CONFIRMED a channel live.
     private final Map<String, LiveRecord> lastConfirmedLive = new ConcurrentHashMap<>();
     private static final Duration LIVE_GRACE_WINDOW = Duration.ofMinutes(6);
 
     private record LiveRecord(String videoId, Instant seenAt) {}
     private record CachedValue(String videoId, Instant expiresAt) {}
-
-    private static final Pattern CANONICAL_WATCH = Pattern.compile(
-        "<link rel=\"canonical\" href=\"https://www\\.youtube\\.com/watch\\?v=([a-zA-Z0-9_-]{6,})\""
-    );
-    private static final Pattern IS_LIVE_MARKER = Pattern.compile("\"isLiveNow\":true|\"isLive\":true");
+    
+    // We cache the resolved status object to hold onto the state (live, upcoming, or fallback)
+    private record CachedStatus(ChannelStatus status, Instant expiresAt) {}
 
     public ChannelStatus getStatus(String key) {
         ChannelRegistry.ChannelInfo info = ChannelRegistry.get(key);
         if (info == null) {
-            return new ChannelStatus(key, null, false, Instant.now().toString(), "unknown_channel_key");
+            return new ChannelStatus(key, null, false, false, Instant.now().toString(), "unknown_channel_key");
         }
         return getStatus(info);
     }
 
-    /**
-     * Same live-check + fallback logic, but for a channel that isn't in the
-     * static registry — used for visitor-added "My Channels".
-     */
     public ChannelStatus getStatus(ChannelRegistry.ChannelInfo info) {
-        String liveVideoId = checkLiveCached(info);
-        if (liveVideoId != null) {
-            lastConfirmedLive.put(info.key(), new LiveRecord(liveVideoId, Instant.now()));
-            return new ChannelStatus(info.key(), liveVideoId, true, Instant.now().toString(), null);
+        // 1. Check in-memory cache first
+        CachedStatus cached = statusCache.get(info.key());
+        if (cached != null && cached.expiresAt().isAfter(Instant.now())) {
+            return cached.status();
         }
 
-        // This particular check came back negative — but if we confirmed
-        // live recently, treat this as a probable blip, not a real end.
+        ChannelStatus status = resolveStatus(info);
+        
+        // Cache the status for 45 seconds to stay responsive without destroying API quota
+        statusCache.put(info.key(), new CachedStatus(status, Instant.now().plusSeconds(45)));
+        return status;
+    }
+
+    private ChannelStatus resolveStatus(ChannelRegistry.ChannelInfo info) {
+        // 2. Query Live status
+        String liveVideoId = fetchStreamByEvent(info.channelId(), "live");
+        if (liveVideoId != null) {
+            lastConfirmedLive.put(info.key(), new LiveRecord(liveVideoId, Instant.now()));
+            // Return status: isLive = true, isUpcoming = false
+            return new ChannelStatus(info.key(), liveVideoId, true, false, Instant.now().toString(), null);
+        }
+
+        // 3. Grace window logic for brief live streams drops / blips
         LiveRecord lastLive = lastConfirmedLive.get(info.key());
         if (lastLive != null && Duration.between(lastLive.seenAt(), Instant.now()).compareTo(LIVE_GRACE_WINDOW) < 0) {
-            return new ChannelStatus(info.key(), lastLive.videoId(), true, Instant.now().toString(),
+            return new ChannelStatus(info.key(), lastLive.videoId(), true, false, Instant.now().toString(),
                 "held over from last confirmed live check " + Duration.between(lastLive.seenAt(), Instant.now()).toSeconds() + "s ago");
         }
         lastConfirmedLive.remove(info.key());
 
+        // 4. Query Upcoming status if nothing is live
+        String upcomingVideoId = fetchStreamByEvent(info.channelId(), "upcoming");
+        if (upcomingVideoId != null) {
+            // Return status: isLive = false, isUpcoming = true
+            return new ChannelStatus(info.key(), upcomingVideoId, false, true, Instant.now().toString(), "Upcoming broadcast scheduled");
+        }
+
+        // 5. Fallback: Latest uploaded video
         if (apiKey == null || apiKey.isBlank()) {
-            return new ChannelStatus(info.key(), null, false, Instant.now().toString(),
+            return new ChannelStatus(info.key(), null, false, false, Instant.now().toString(),
                 "no_api_key: YOUTUBE_API_KEY is not set (or not being read) on the server");
         }
 
         FallbackResult fallback = latestPublicVideoCached(info);
-        return new ChannelStatus(info.key(), fallback.videoId(), false, Instant.now().toString(), fallback.note());
+        // Return status: isLive = false, isUpcoming = false
+        return new ChannelStatus(info.key(), fallback.videoId(), false, false, Instant.now().toString(), fallback.note());
     }
 
     /**
-     * Resolves a visitor-typed channel handle (e.g. "@somechannel", a full
-     * channel URL, or a raw UC... channel ID) into a real channel ID, so a
-     * "My Channels" card can be built and polled going forward.
+     * Reusable method to search for either active "live" or "upcoming" event types.
      */
+    private String fetchStreamByEvent(String channelId, String eventType) {
+        if (apiKey == null || apiKey.isBlank()) {
+            return null;
+        }
+
+        try {
+            String url = "https://www.googleapis.com/youtube/v3/search"
+                    + "?part=snippet"
+                    + "&channelId=" + channelId
+                    + "&eventType=" + eventType
+                    + "&type=video"
+                    + "&maxResults=1"
+                    + "&key=" + apiKey;
+
+            JsonNode root = getJson(url);
+            JsonNode items = root.path("items");
+
+            if (items.isEmpty()) {
+                return null;
+            }
+
+            return items.get(0)
+                    .path("id")
+                    .path("videoId")
+                    .asText(null);
+
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // ---------- Resolving handles and fallbacks remain the same ----------
+
     public ResolvedChannel resolveHandle(String rawInput) {
         String input = rawInput.trim();
-
-        // Already a raw channel ID (e.g. from a /channel/UC... URL)
         Matcher channelIdInUrl = Pattern.compile("channel/(UC[a-zA-Z0-9_-]{20,})").matcher(input);
         if (channelIdInUrl.find()) {
             return fetchChannelTitleAndHandle(channelIdInUrl.group(1));
@@ -106,7 +147,6 @@ public class ChannelStatusService {
             return fetchChannelTitleAndHandle(input);
         }
 
-        // Otherwise treat it as a handle — pull the @name out of a URL if one was pasted
         String handle = input;
         Matcher handleInUrl = Pattern.compile("youtube\\.com/@([a-zA-Z0-9_.-]+)").matcher(input);
         if (handleInUrl.find()) {
@@ -159,58 +199,6 @@ public class ChannelStatusService {
 
     public record ResolvedChannel(String channelId, String title, String handle, String error) {}
 
-    // ---------- Live check: free, scrapes the public /live page ----------
-
-    private String checkLiveCached(ChannelRegistry.ChannelInfo info) {
-        CachedValue cached = liveCache.get(info.key());
-        if (cached != null && cached.expiresAt().isAfter(Instant.now())) {
-            return cached.videoId();
-        }
-        String result = checkLive(info);
-        liveCache.put(info.key(), new CachedValue(result, Instant.now().plusSeconds(45)));
-        return result;
-    }
-
-private String checkLive(ChannelRegistry.ChannelInfo info) {
-
-    if (apiKey == null || apiKey.isBlank()) {
-        return null;
-    }
-
-    try {
-
-        String url =
-                "https://www.googleapis.com/youtube/v3/search"
-                        + "?part=snippet"
-                        + "&channelId=" + info.channelId()
-                        + "&eventType=live"
-                        + "&type=video"
-                        + "&maxResults=1"
-                        + "&key=" + apiKey;
-
-        JsonNode root = getJson(url);
-
-        JsonNode items = root.path("items");
-
-        if (items.isEmpty()) {
-            return null;
-        }
-
-        String videoId =
-                items.get(0)
-                        .path("id")
-                        .path("videoId")
-                        .asText(null);
-
-        return videoId;
-
-    } catch (Exception e) {
-        return null;
-    }
-}
-
-    // ---------- Fallback: latest public upload via YouTube Data API ----------
-
     private record FallbackResult(String videoId, String note) {}
 
     private FallbackResult latestPublicVideoCached(ChannelRegistry.ChannelInfo info) {
@@ -260,9 +248,6 @@ private String checkLive(ChannelRegistry.ChannelInfo info) {
             + "&key=" + apiKey;
 
         JsonNode root = getJson(url);
-        // videos.list preserves no particular order guarantee across ids,
-        // so re-walk candidateIds in their original (newest-first) order
-        // and match against whichever came back as public.
         Map<String, String> statusByVideoId = new java.util.HashMap<>();
         for (JsonNode item : root.path("items")) {
             String vid = item.path("id").asText();
