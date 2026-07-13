@@ -30,19 +30,22 @@ public class ChannelStatusService {
     @Value("${youtube.api.key:}")
     private String apiKey;
 
-    // Simple in-memory cache so many visitors don't each trigger a fresh check.
+    // Cache holding the fully resolved status object to avoid slamming endpoints
     private final Map<String, CachedStatus> statusCache = new ConcurrentHashMap<>();
     private final Map<String, CachedValue> latestCache = new ConcurrentHashMap<>();
 
-    // Remembers the last time we CONFIRMED a channel live.
+    // Tracks last confirmed live details to prevent flickering from transient drops
     private final Map<String, LiveRecord> lastConfirmedLive = new ConcurrentHashMap<>();
     private static final Duration LIVE_GRACE_WINDOW = Duration.ofMinutes(6);
 
     private record LiveRecord(String videoId, Instant seenAt) {}
     private record CachedValue(String videoId, Instant expiresAt) {}
-    
-    // We cache the resolved status object to hold onto the state (live, upcoming, or fallback)
     private record CachedStatus(ChannelStatus status, Instant expiresAt) {}
+
+    private static final Pattern CANONICAL_WATCH = Pattern.compile(
+        "<link rel=\"canonical\" href=\"https://www\\.youtube\\.com/watch\\?v=([a-zA-Z0-9_-]{6,})\""
+    );
+    private static final Pattern IS_LIVE_MARKER = Pattern.compile("\"isLiveNow\":true|\"isLive\":true");
 
     public ChannelStatus getStatus(String key) {
         ChannelRegistry.ChannelInfo info = ChannelRegistry.get(key);
@@ -53,29 +56,25 @@ public class ChannelStatusService {
     }
 
     public ChannelStatus getStatus(ChannelRegistry.ChannelInfo info) {
-        // 1. Check in-memory cache first
         CachedStatus cached = statusCache.get(info.key());
         if (cached != null && cached.expiresAt().isAfter(Instant.now())) {
             return cached.status();
         }
 
         ChannelStatus status = resolveStatus(info);
-        
-        // Cache the status for 45 seconds to stay responsive without destroying API quota
         statusCache.put(info.key(), new CachedStatus(status, Instant.now().plusSeconds(45)));
         return status;
     }
 
     private ChannelStatus resolveStatus(ChannelRegistry.ChannelInfo info) {
-        // 2. Query Live status
-        String liveVideoId = fetchStreamByEvent(info.channelId(), "live");
+        // 1. Try to scrape the live URL (instant, handles streams perfectly with 0 quota)
+        String liveVideoId = checkLive(info);
         if (liveVideoId != null) {
             lastConfirmedLive.put(info.key(), new LiveRecord(liveVideoId, Instant.now()));
-            // Return status: isLive = true, isUpcoming = false
             return new ChannelStatus(info.key(), liveVideoId, true, false, Instant.now().toString(), null);
         }
 
-        // 3. Grace window logic for brief live streams drops / blips
+        // 2. Apply grace window logic to avoid flickers
         LiveRecord lastLive = lastConfirmedLive.get(info.key());
         if (lastLive != null && Duration.between(lastLive.seenAt(), Instant.now()).compareTo(LIVE_GRACE_WINDOW) < 0) {
             return new ChannelStatus(info.key(), lastLive.videoId(), true, false, Instant.now().toString(),
@@ -83,27 +82,58 @@ public class ChannelStatusService {
         }
         lastConfirmedLive.remove(info.key());
 
-        // 4. Query Upcoming status if nothing is live
+        // 3. Fallback: If not live, check for an upcoming scheduled broadcast
         String upcomingVideoId = fetchStreamByEvent(info.channelId(), "upcoming");
         if (upcomingVideoId != null) {
-            // Return status: isLive = false, isUpcoming = true
             return new ChannelStatus(info.key(), upcomingVideoId, false, true, Instant.now().toString(), "Upcoming broadcast scheduled");
         }
 
-        // 5. Fallback: Latest uploaded video
+        // 4. Default: No live or upcoming streams, fetch the latest public uploaded video
         if (apiKey == null || apiKey.isBlank()) {
             return new ChannelStatus(info.key(), null, false, false, Instant.now().toString(),
                 "no_api_key: YOUTUBE_API_KEY is not set (or not being read) on the server");
         }
 
         FallbackResult fallback = latestPublicVideoCached(info);
-        // Return status: isLive = false, isUpcoming = false
         return new ChannelStatus(info.key(), fallback.videoId(), false, false, Instant.now().toString(), fallback.note());
     }
 
-    /**
-     * Reusable method to search for either active "live" or "upcoming" event types.
-     */
+    // ---------- Scrapes the public /live route directly (Fast & Free) ----------
+
+    private String checkLive(ChannelRegistry.ChannelInfo info) {
+        try {
+            String liveUrl = "https://www.youtube.com/channel/" + info.channelId() + "/live";
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(liveUrl))
+                .timeout(Duration.ofSeconds(6))
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                .header("Accept-Language", "en-US,en;q=0.9")
+                .GET()
+                .build();
+
+            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+            String body = response.body();
+
+            Matcher markerMatcher = IS_LIVE_MARKER.matcher(body);
+            if (!markerMatcher.find()) {
+                return null; 
+            }
+
+            Matcher matcher = CANONICAL_WATCH.matcher(body);
+            if (matcher.find()) {
+                String videoId = matcher.group(1);
+                if (videoId != null && !videoId.contains("channel") && !videoId.contains("user")) {
+                    return videoId;
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Error scraping live status for " + info.key() + ": " + e.getMessage());
+        }
+        return null;
+    }
+
+    // ---------- Safe API query for upcoming scheduled streams ----------
+
     private String fetchStreamByEvent(String channelId, String eventType) {
         if (apiKey == null || apiKey.isBlank()) {
             return null;
@@ -135,7 +165,7 @@ public class ChannelStatusService {
         }
     }
 
-    // ---------- Resolving handles and fallbacks remain the same ----------
+    // ---------- Rest of Channel Parsing & Fallback Logic ----------
 
     public ResolvedChannel resolveHandle(String rawInput) {
         String input = rawInput.trim();
@@ -156,7 +186,7 @@ public class ChannelStatusService {
         }
 
         if (apiKey == null || apiKey.isBlank()) {
-            return new ResolvedChannel(null, null, null, "no_api_key");
+            return new ResolvedChannel(null, null, handle, "no_api_key");
         }
 
         try {

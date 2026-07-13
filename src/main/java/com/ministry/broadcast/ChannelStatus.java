@@ -4,7 +4,7 @@ public record ChannelStatus(
     String channel,
     String videoId,
     boolean live,
-    boolean upcoming, // Added to track scheduled streams
+    boolean upcoming, // Must be present
     String checkedAt,
     String note
 ) {}
