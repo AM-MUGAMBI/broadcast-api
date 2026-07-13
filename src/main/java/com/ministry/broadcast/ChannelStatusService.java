@@ -27,7 +27,7 @@ public class ChannelStatusService {
 
     private final ObjectMapper mapper = new ObjectMapper();
 
-    @Value("${youtube.api.key:}")
+    @Value("${YOUTUBE_API_KEY:}")
     private String apiKey;
 
     // Cache holding the fully resolved status object to avoid slamming endpoints
