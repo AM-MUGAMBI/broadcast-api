@@ -63,8 +63,14 @@ public class ChannelStatusService {
     }
 
     private ChannelStatus resolveStatus(ChannelRegistry.ChannelInfo info) {
-        // 1. Try to scrape the live URL (instant, handles active streams with 0 quota)
-        String liveVideoId = checkLive(info);
+        // Guard against missing API Key
+        if (apiKey == null || apiKey.isBlank()) {
+            return new ChannelStatus(info.key(), null, false, false, Instant.now().toString(),
+                "no_api_key: YOUTUBE_API_KEY is not set or not being read on the server.");
+        }
+
+        // 1. Try to fetch the active LIVE stream using the official API (No blocking!)
+        String liveVideoId = fetchStreamByEvent(info.channelId(), "live");
         if (liveVideoId != null) {
             lastConfirmedLive.put(info.key(), new LiveRecord(liveVideoId, Instant.now()));
             return new ChannelStatus(info.key(), liveVideoId, true, false, Instant.now().toString(), null);
@@ -78,68 +84,18 @@ public class ChannelStatusService {
         }
         lastConfirmedLive.remove(info.key());
 
-        // 3. Fallback: If not live, check for an upcoming scheduled broadcast
+        // 3. Fallback: Check for an upcoming scheduled broadcast
         String upcomingVideoId = fetchStreamByEvent(info.channelId(), "upcoming");
         if (upcomingVideoId != null) {
             return new ChannelStatus(info.key(), upcomingVideoId, false, true, Instant.now().toString(), "Upcoming broadcast scheduled");
         }
 
         // 4. Default: No live or upcoming streams, fetch the latest public uploaded video
-        if (apiKey == null || apiKey.isBlank()) {
-            return new ChannelStatus(info.key(), null, false, false, Instant.now().toString(),
-                "no_api_key: YOUTUBE_API_KEY is not set (or not being read) on the server. API Key value: [" + apiKey + "]");
-        }
-
         FallbackResult fallback = latestPublicVideoCached(info);
         return new ChannelStatus(info.key(), fallback.videoId(), false, false, Instant.now().toString(), fallback.note());
     }
 
-    // ---------- Scrapes the public /live route using bulletproof pattern checks ----------
-
-    private String checkLive(ChannelRegistry.ChannelInfo info) {
-        try {
-            String liveUrl = "https://www.youtube.com/channel/" + info.channelId() + "/live";
-            HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(liveUrl))
-                .timeout(Duration.ofSeconds(6))
-                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                .header("Accept-Language", "en-US,en;q=0.9")
-                .GET()
-                .build();
-
-            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
-            String body = response.body();
-
-            // Double check if the HTML actually signals live activity 
-            if (!body.contains("\"style\":\"BADGE_STYLE_TYPE_LIVE_NOW\"") && !body.contains("isLiveNow\":true")) {
-                return null; // Stop early if there is no live indicator in the HTML structure
-            }
-
-            // Extract the video ID directly from the watch URL embedded in the scripts
-            Pattern watchPattern = Pattern.compile("\"webCommandMetadata\"\\s*:\\s*\\{\\s*\"url\"\\s*:\\s*\"/watch\\?v=([a-zA-Z0-9_-]{11})\"");
-            Matcher matcher = watchPattern.matcher(body);
-            if (matcher.find()) {
-                return matcher.group(1);
-            }
-
-            // Fallback match check (checking the player response block)
-            Pattern playerPattern = Pattern.compile("ytInitialPlayerResponse\\s*=\\s*(\\{.+?\\});");
-            Matcher playerMatcher = playerPattern.matcher(body);
-            if (playerMatcher.find()) {
-                JsonNode root = mapper.readTree(playerMatcher.group(1));
-                JsonNode videoDetails = root.path("videoDetails");
-                if (videoDetails.path("isLive").asBoolean(false)) {
-                    return videoDetails.path("videoId").asText(null);
-                }
-            }
-
-        } catch (Exception e) {
-            System.err.println("Error scraping live status for " + info.key() + ": " + e.getMessage());
-        }
-        return null;
-    }
-
-    // ---------- Safe API query for upcoming scheduled streams ----------
+    // ---------- Safe Official API query for Live / Upcoming streams ----------
 
     private String fetchStreamByEvent(String channelId, String eventType) {
         if (apiKey == null || apiKey.isBlank()) {
@@ -147,6 +103,7 @@ public class ChannelStatusService {
         }
 
         try {
+            // Using official Google API search endpoint to query live or upcoming status
             String url = "https://www.googleapis.com/youtube/v3/search"
                     + "?part=snippet"
                     + "&channelId=" + channelId
@@ -156,8 +113,14 @@ public class ChannelStatusService {
                     + "&key=" + apiKey;
 
             JsonNode root = getJson(url);
-            JsonNode items = root.path("items");
+            
+            // Check for API errors returned in the response payload
+            if (root.has("error")) {
+                System.err.println("YouTube API error while checking " + eventType + ": " + root.path("error").path("message").asText());
+                return null;
+            }
 
+            JsonNode items = root.path("items");
             if (items.isEmpty()) {
                 return null;
             }
@@ -168,6 +131,7 @@ public class ChannelStatusService {
                     .asText(null);
 
         } catch (Exception e) {
+            System.err.println("Network error calling YouTube API for " + eventType + ": " + e.getMessage());
             return null;
         }
     }
