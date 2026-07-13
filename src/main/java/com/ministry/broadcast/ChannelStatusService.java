@@ -27,14 +27,15 @@ public class ChannelStatusService {
 
     private final ObjectMapper mapper = new ObjectMapper();
 
-    @Value("${YOUTUBE_API_KEY:}")
+    // LOOKS FOR: 
+    // 1st: application.properties value: youtube.api.key
+    // 2nd: System Environment Variable: YOUTUBE_API_KEY
+    @Value("${youtube.api.key:${YOUTUBE_API_KEY:}}")
     private String apiKey;
 
-    // Cache holding the fully resolved status object to avoid slamming endpoints
     private final Map<String, CachedStatus> statusCache = new ConcurrentHashMap<>();
     private final Map<String, CachedValue> latestCache = new ConcurrentHashMap<>();
 
-    // Tracks last confirmed live details to prevent flickering from transient drops
     private final Map<String, LiveRecord> lastConfirmedLive = new ConcurrentHashMap<>();
     private static final Duration LIVE_GRACE_WINDOW = Duration.ofMinutes(6);
 
@@ -42,10 +43,10 @@ public class ChannelStatusService {
     private record CachedValue(String videoId, Instant expiresAt) {}
     private record CachedStatus(ChannelStatus status, Instant expiresAt) {}
 
-    private static final Pattern CANONICAL_WATCH = Pattern.compile(
-        "<link rel=\"canonical\" href=\"https://www\\.youtube\\.com/watch\\?v=([a-zA-Z0-9_-]{6,})\""
+    // Regex to extract the embedded player configuration JSON from the HTML source
+    private static final Pattern YT_PLAYER_RESPONSE_PATTERN = Pattern.compile(
+        "ytInitialPlayerResponse\\s*=\\s*(\\{.+?\\});"
     );
-    private static final Pattern IS_LIVE_MARKER = Pattern.compile("\"isLiveNow\":true|\"isLive\":true");
 
     public ChannelStatus getStatus(String key) {
         ChannelRegistry.ChannelInfo info = ChannelRegistry.get(key);
@@ -62,12 +63,12 @@ public class ChannelStatusService {
         }
 
         ChannelStatus status = resolveStatus(info);
-        statusCache.put(info.key(), new CachedStatus(status, Instant.now().plusSeconds(45)));
+        statusCache.put(info.key(), new CachedStatus(status, Instant.now().plusSeconds(30)));
         return status;
     }
 
     private ChannelStatus resolveStatus(ChannelRegistry.ChannelInfo info) {
-        // 1. Try to scrape the live URL (instant, handles streams perfectly with 0 quota)
+        // 1. Try to scrape the live URL (instant, handles active streams with 0 quota)
         String liveVideoId = checkLive(info);
         if (liveVideoId != null) {
             lastConfirmedLive.put(info.key(), new LiveRecord(liveVideoId, Instant.now()));
@@ -91,14 +92,14 @@ public class ChannelStatusService {
         // 4. Default: No live or upcoming streams, fetch the latest public uploaded video
         if (apiKey == null || apiKey.isBlank()) {
             return new ChannelStatus(info.key(), null, false, false, Instant.now().toString(),
-                "no_api_key: YOUTUBE_API_KEY is not set (or not being read) on the server");
+                "no_api_key: YOUTUBE_API_KEY is not set (or not being read) on the server. API Key value: [" + apiKey + "]");
         }
 
         FallbackResult fallback = latestPublicVideoCached(info);
         return new ChannelStatus(info.key(), fallback.videoId(), false, false, Instant.now().toString(), fallback.note());
     }
 
-    // ---------- Scrapes the public /live route directly (Fast & Free) ----------
+    // ---------- Scrapes the public /live route using embedded JSON parsing ----------
 
     private String checkLive(ChannelRegistry.ChannelInfo info) {
         try {
@@ -108,21 +109,25 @@ public class ChannelStatusService {
                 .timeout(Duration.ofSeconds(6))
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 .header("Accept-Language", "en-US,en;q=0.9")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
                 .GET()
                 .build();
 
             HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
             String body = response.body();
 
-            Matcher markerMatcher = IS_LIVE_MARKER.matcher(body);
-            if (!markerMatcher.find()) {
-                return null; 
-            }
-
-            Matcher matcher = CANONICAL_WATCH.matcher(body);
+            // Find the JSON block containing the video player details
+            Matcher matcher = YT_PLAYER_RESPONSE_PATTERN.matcher(body);
             if (matcher.find()) {
-                String videoId = matcher.group(1);
-                if (videoId != null && !videoId.contains("channel") && !videoId.contains("user")) {
+                String jsonStr = matcher.group(1);
+                JsonNode root = mapper.readTree(jsonStr);
+                
+                // Inspect the videoDetails section
+                JsonNode videoDetails = root.path("videoDetails");
+                boolean isLive = videoDetails.path("isLive").asBoolean(false);
+                String videoId = videoDetails.path("videoId").asText(null);
+
+                if (isLive && videoId != null) {
                     return videoId;
                 }
             }
