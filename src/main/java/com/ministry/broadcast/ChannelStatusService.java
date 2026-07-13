@@ -43,11 +43,6 @@ public class ChannelStatusService {
     private record CachedValue(String videoId, Instant expiresAt) {}
     private record CachedStatus(ChannelStatus status, Instant expiresAt) {}
 
-    // Regex to extract the embedded player configuration JSON from the HTML source
-    private static final Pattern YT_PLAYER_RESPONSE_PATTERN = Pattern.compile(
-        "ytInitialPlayerResponse\\s*=\\s*(\\{.+?\\});"
-    );
-
     public ChannelStatus getStatus(String key) {
         ChannelRegistry.ChannelInfo info = ChannelRegistry.get(key);
         if (info == null) {
@@ -99,7 +94,7 @@ public class ChannelStatusService {
         return new ChannelStatus(info.key(), fallback.videoId(), false, false, Instant.now().toString(), fallback.note());
     }
 
-    // ---------- Scrapes the public /live route using embedded JSON parsing ----------
+    // ---------- Scrapes the public /live route using bulletproof pattern checks ----------
 
     private String checkLive(ChannelRegistry.ChannelInfo info) {
         try {
@@ -109,28 +104,35 @@ public class ChannelStatusService {
                 .timeout(Duration.ofSeconds(6))
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
                 .header("Accept-Language", "en-US,en;q=0.9")
-                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
                 .GET()
                 .build();
 
             HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
             String body = response.body();
 
-            // Find the JSON block containing the video player details
-            Matcher matcher = YT_PLAYER_RESPONSE_PATTERN.matcher(body);
-            if (matcher.find()) {
-                String jsonStr = matcher.group(1);
-                JsonNode root = mapper.readTree(jsonStr);
-                
-                // Inspect the videoDetails section
-                JsonNode videoDetails = root.path("videoDetails");
-                boolean isLive = videoDetails.path("isLive").asBoolean(false);
-                String videoId = videoDetails.path("videoId").asText(null);
+            // Double check if the HTML actually signals live activity 
+            if (!body.contains("\"style\":\"BADGE_STYLE_TYPE_LIVE_NOW\"") && !body.contains("isLiveNow\":true")) {
+                return null; // Stop early if there is no live indicator in the HTML structure
+            }
 
-                if (isLive && videoId != null) {
-                    return videoId;
+            // Extract the video ID directly from the watch URL embedded in the scripts
+            Pattern watchPattern = Pattern.compile("\"webCommandMetadata\"\\s*:\\s*\\{\\s*\"url\"\\s*:\\s*\"/watch\\?v=([a-zA-Z0-9_-]{11})\"");
+            Matcher matcher = watchPattern.matcher(body);
+            if (matcher.find()) {
+                return matcher.group(1);
+            }
+
+            // Fallback match check (checking the player response block)
+            Pattern playerPattern = Pattern.compile("ytInitialPlayerResponse\\s*=\\s*(\\{.+?\\});");
+            Matcher playerMatcher = playerPattern.matcher(body);
+            if (playerMatcher.find()) {
+                JsonNode root = mapper.readTree(playerMatcher.group(1));
+                JsonNode videoDetails = root.path("videoDetails");
+                if (videoDetails.path("isLive").asBoolean(false)) {
+                    return videoDetails.path("videoId").asText(null);
                 }
             }
+
         } catch (Exception e) {
             System.err.println("Error scraping live status for " + info.key() + ": " + e.getMessage());
         }
