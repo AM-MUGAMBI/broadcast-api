@@ -35,7 +35,6 @@ public class ChannelStatusService {
 
     private record CachedStatus(ChannelStatus status, Instant expiresAt) {}
 
-    // Method used by /api/channel-status
     public ChannelStatus getStatus(String key) {
         ChannelRegistry.ChannelInfo info = ChannelRegistry.get(key);
         if (info == null) {
@@ -44,7 +43,6 @@ public class ChannelStatusService {
         return getStatus(info);
     }
 
-    // Overloaded method used by /api/channel-status-custom
     public ChannelStatus getStatus(ChannelRegistry.ChannelInfo info) {
         CachedStatus cached = statusCache.get(info.key());
         if (cached != null && cached.expiresAt().isAfter(Instant.now())) {
@@ -62,7 +60,6 @@ public class ChannelStatusService {
         }
 
         try {
-            // 1. Check for LIVE first via Videos API
             List<String> recentVideoIds = fetchRecentVideoIds(info.uploadsPlaylistId(), 5);
             if (!recentVideoIds.isEmpty()) {
                 String liveId = checkLiveViaVideosApi(recentVideoIds);
@@ -71,13 +68,11 @@ public class ChannelStatusService {
                 }
             }
 
-            // 2. Check for UPCOMING via Search API
             String upcomingId = fetchStreamByEvent(info.channelId(), "upcoming");
             if (upcomingId != null) {
                 return new ChannelStatus(info.key(), upcomingId, false, true, Instant.now().toString(), "Upcoming broadcast");
             }
 
-            // 3. Fallback to Latest Upload
             if (!recentVideoIds.isEmpty()) {
                 return new ChannelStatus(info.key(), recentVideoIds.get(0), false, false, Instant.now().toString(), "Latest upload");
             }
@@ -90,10 +85,10 @@ public class ChannelStatusService {
     }
 
     private String checkLiveViaVideosApi(List<String> videoIds) throws Exception {
-        String url = "https://www.googleapis.com/youtube/v3/videos?part=snippet&id=" 
+        String url = "https://www.googleapis.com/youtube/v3/videos?part=snippet&id="
                      + String.join(",", videoIds) + "&key=" + apiKey;
         JsonNode root = getJson(url);
-        
+
         for (JsonNode item : root.path("items")) {
             if ("live".equals(item.path("snippet").path("liveBroadcastContent").asText())) {
                 return item.path("id").asText();
@@ -104,7 +99,7 @@ public class ChannelStatusService {
 
     private String fetchStreamByEvent(String channelId, String eventType) {
         try {
-            String url = "https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=" + channelId 
+            String url = "https://www.googleapis.com/youtube/v3/search?part=snippet&channelId=" + channelId
                          + "&eventType=" + eventType + "&type=video&maxResults=1&key=" + apiKey;
             JsonNode root = getJson(url);
             JsonNode items = root.path("items");
@@ -115,7 +110,7 @@ public class ChannelStatusService {
     }
 
     private List<String> fetchRecentVideoIds(String playlistId, int max) throws Exception {
-        String url = "https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&maxResults=" + max 
+        String url = "https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&maxResults=" + max
                      + "&playlistId=" + playlistId + "&key=" + apiKey;
         JsonNode root = getJson(url);
         List<String> ids = new java.util.ArrayList<>();
@@ -134,11 +129,21 @@ public class ChannelStatusService {
 
     public ResolvedChannel resolveHandle(String rawInput) {
         String input = rawInput.trim();
+
+        if (apiKey == null || apiKey.isBlank()) {
+            return new ResolvedChannel(null, null, null, "no_api_key");
+        }
+
         Matcher channelIdInUrl = Pattern.compile("channel/(UC[a-zA-Z0-9_-]{20,})").matcher(input);
         if (channelIdInUrl.find()) return fetchChannelTitleAndHandle(channelIdInUrl.group(1));
         if (input.matches("UC[a-zA-Z0-9_-]{20,}")) return fetchChannelTitleAndHandle(input);
 
         String handle = input.startsWith("@") ? input.substring(1) : input;
+        Matcher handleInUrl = Pattern.compile("youtube\\.com/@([a-zA-Z0-9_.-]+)").matcher(input);
+        if (handleInUrl.find()) {
+            handle = handleInUrl.group(1);
+        }
+
         try {
             String url = "https://www.googleapis.com/youtube/v3/channels?part=id,snippet&forHandle=" + handle + "&key=" + apiKey;
             JsonNode root = getJson(url);
@@ -151,6 +156,9 @@ public class ChannelStatusService {
     }
 
     private ResolvedChannel fetchChannelTitleAndHandle(String channelId) {
+        if (apiKey == null || apiKey.isBlank()) {
+            return new ResolvedChannel(channelId, null, null, "no_api_key");
+        }
         try {
             String url = "https://www.googleapis.com/youtube/v3/channels?part=snippet&id=" + channelId + "&key=" + apiKey;
             JsonNode root = getJson(url);
