@@ -68,46 +68,74 @@
 
     return getStatus(custom);
 }
-        public ChannelStatus getStatus(ChannelRegistry.ChannelInfo info) {
-            CachedStatus cached = statusCache.get(info.key());
-            if (cached != null && cached.expiresAt().isAfter(Instant.now())) {
-                return cached.status();
-            }
+private ChannelStatus resolveStatus(ChannelRegistry.ChannelInfo info) {
+    if (apiKey == null || apiKey.isBlank()) {
+        return new ChannelStatus(info.key(), null, false, false, Instant.now().toString(), "no_api_key");
+    }
 
-            ChannelStatus status = resolveStatus(info);
-            statusCache.put(info.key(), new CachedStatus(status, Instant.now().plus(CACHE_DURATION)));
-            return status;
+    try {
+
+        // Check for a LIVE stream first
+        String liveId = fetchStreamByEvent(info.channelId(), "live");
+        if (liveId != null) {
+            return new ChannelStatus(
+                    info.key(),
+                    liveId,
+                    true,
+                    false,
+                    Instant.now().toString(),
+                    null
+            );
         }
 
-        private ChannelStatus resolveStatus(ChannelRegistry.ChannelInfo info) {
-            if (apiKey == null || apiKey.isBlank()) {
-                return new ChannelStatus(info.key(), null, false, false, Instant.now().toString(), "no_api_key");
-            }
+        // Then load recent uploads
+        List<String> recentVideoIds = fetchRecentVideoIds(info.uploadsPlaylistId(), 5);
 
-            try {
-                List<String> recentVideoIds = fetchRecentVideoIds(info.uploadsPlaylistId(), 5);
-                if (!recentVideoIds.isEmpty()) {
-                    String liveId = checkLiveViaVideosApi(recentVideoIds);
-                    if (liveId != null) {
-                        return new ChannelStatus(info.key(), liveId, true, false, Instant.now().toString(), null);
-                    }
-                }
-
-                String upcomingId = fetchStreamByEvent(info.channelId(), "upcoming");
-                if (upcomingId != null) {
-                    return new ChannelStatus(info.key(), upcomingId, false, true, Instant.now().toString(), "Upcoming broadcast");
-                }
-
-                if (!recentVideoIds.isEmpty()) {
-                    return new ChannelStatus(info.key(), recentVideoIds.get(0), false, false, Instant.now().toString(), "Latest upload");
-                }
-
-                return new ChannelStatus(info.key(), null, false, false, Instant.now().toString(), "No content found");
-
-            } catch (Exception e) {
-                return new ChannelStatus(info.key(), null, false, false, Instant.now().toString(), "api_error: " + e.getMessage());
-            }
+        // Check for an upcoming stream
+        String upcomingId = fetchStreamByEvent(info.channelId(), "upcoming");
+        if (upcomingId != null) {
+            return new ChannelStatus(
+                    info.key(),
+                    upcomingId,
+                    false,
+                    true,
+                    Instant.now().toString(),
+                    "Upcoming broadcast"
+            );
         }
+
+        // Fall back to the latest upload
+        if (!recentVideoIds.isEmpty()) {
+            return new ChannelStatus(
+                    info.key(),
+                    recentVideoIds.get(0),
+                    false,
+                    false,
+                    Instant.now().toString(),
+                    "Latest upload"
+            );
+        }
+
+        return new ChannelStatus(
+                info.key(),
+                null,
+                false,
+                false,
+                Instant.now().toString(),
+                "No content found"
+        );
+
+    } catch (Exception e) {
+        return new ChannelStatus(
+                info.key(),
+                null,
+                false,
+                false,
+                Instant.now().toString(),
+                "api_error: " + e.getMessage()
+        );
+    }
+}
 
         private String checkLiveViaVideosApi(List<String> videoIds) throws Exception {
             String url = "https://www.googleapis.com/youtube/v3/videos?part=snippet&id="
