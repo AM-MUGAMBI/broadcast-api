@@ -6,7 +6,7 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
-@CrossOrigin(origins = "*") // allow the static front-end (any host) to call this
+@CrossOrigin(origins = "*")
 public class ChannelStatusController {
 
     private final ChannelStatusService service;
@@ -17,7 +17,7 @@ public class ChannelStatusController {
 
     @GetMapping("/api/channel-status")
     public ChannelStatus channelStatus(@RequestParam String channel) {
-        return service.getStatus(channel);
+        return service.getStatusForAnyChannel(channel);
     }
 
     @GetMapping("/api/resolve-channel")
