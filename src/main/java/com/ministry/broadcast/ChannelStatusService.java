@@ -78,6 +78,8 @@ public class ChannelStatusService {
             return new ChannelStatus(info.key(), liveVideoId, true, false, Instant.now().toString(), null);
         }
 
+        String scrapeDebug = lastLiveCheckDebug.get(info.key());
+
         LiveRecord lastLive = lastConfirmedLive.get(info.key());
         if (lastLive != null && Duration.between(lastLive.seenAt(), Instant.now()).compareTo(LIVE_GRACE_WINDOW) < 0) {
             return new ChannelStatus(info.key(), lastLive.videoId(), true, false, Instant.now().toString(),
@@ -86,26 +88,33 @@ public class ChannelStatusService {
         lastConfirmedLive.remove(info.key());
 
         if (apiKey == null || apiKey.isBlank()) {
-            return new ChannelStatus(info.key(), null, false, false, Instant.now().toString(), "no_api_key");
+            return new ChannelStatus(info.key(), null, false, false, Instant.now().toString(),
+                "no_api_key | " + scrapeDebug);
         }
 
         FallbackResult fallback = latestPublicVideoCached(info);
-        return new ChannelStatus(info.key(), fallback.videoId(), false, false, Instant.now().toString(), fallback.note());
+        String combinedNote = (scrapeDebug != null ? scrapeDebug + " || " : "") + fallback.note();
+        return new ChannelStatus(info.key(), fallback.videoId(), false, false, Instant.now().toString(), combinedNote);
     }
 
     // ---------- Live check: free, scrapes the public /live page (no API quota) ----------
+
+    private record LiveCheckResult(String videoId, String debugNote) {}
 
     private String checkLiveCached(ChannelRegistry.ChannelInfo info) {
         CachedValue cached = liveCache.get(info.key());
         if (cached != null && cached.expiresAt().isAfter(Instant.now())) {
             return cached.videoId();
         }
-        String result = checkLive(info);
-        liveCache.put(info.key(), new CachedValue(result, Instant.now().plusSeconds(45)));
-        return result;
+        LiveCheckResult result = checkLive(info);
+        liveCache.put(info.key(), new CachedValue(result.videoId(), Instant.now().plusSeconds(45)));
+        lastLiveCheckDebug.put(info.key(), result.debugNote());
+        return result.videoId();
     }
 
-    private String checkLive(ChannelRegistry.ChannelInfo info) {
+    private final Map<String, String> lastLiveCheckDebug = new ConcurrentHashMap<>();
+
+    private LiveCheckResult checkLive(ChannelRegistry.ChannelInfo info) {
         try {
             String url = (info.handle() != null && !info.handle().isBlank())
                 ? "https://www.youtube.com/@" + info.handle() + "/live"
@@ -119,15 +128,23 @@ public class ChannelStatusService {
 
             HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
             String body = response.body();
+            int status = response.statusCode();
 
             Matcher canonical = CANONICAL_WATCH.matcher(body);
-            if (canonical.find() && IS_LIVE_MARKER.matcher(body).find()) {
-                return canonical.group(1);
+            boolean canonicalFound = canonical.find();
+            String canonicalVideoId = canonicalFound ? canonical.group(1) : null;
+            boolean liveMarkerFound = IS_LIVE_MARKER.matcher(body).find();
+
+            if (canonicalFound && liveMarkerFound) {
+                return new LiveCheckResult(canonicalVideoId, null);
             }
+            return new LiveCheckResult(null, "scrape_debug: url=" + url + " status=" + status
+                + " bodyLen=" + body.length() + " canonicalFound=" + canonicalFound
+                + " liveMarkerFound=" + liveMarkerFound
+                + (canonicalFound ? " canonicalVideoId=" + canonicalVideoId : ""));
         } catch (Exception e) {
-            // Network hiccup or YouTube changed their markup — fail safe to "not live".
+            return new LiveCheckResult(null, "scrape_error: " + e.getClass().getSimpleName() + " - " + e.getMessage());
         }
-        return null;
     }
 
     // ---------- Fallback: latest public upload via YouTube Data API (cheap: 2 units) ----------
